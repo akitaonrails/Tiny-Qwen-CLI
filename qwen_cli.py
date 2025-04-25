@@ -5,29 +5,36 @@ This tool allows loading source files into the context to have code-aware conver
 Designed to work both locally and within a Docker container.
 """
 
-import sys
 import argparse
+import importlib.util
 import json
-import subprocess
-import time
-from datetime import datetime
-from pathlib import Path
 import logging
 import os
-import traceback
 import re
-from typing import List, Dict, Optional, Any, Callable
-import importlib.util
 import readline  # For better command line input experience
 import signal
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
 import transformers
 from helper_functions.utils import get_language_from_extension
 
 # Transformers & Torch
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, TextStreamer, BitsAndBytesConfig
     from accelerate import Accelerator
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        BitsAndBytesConfig,
+        TextStreamer,
+    )
 except ImportError as e:
     print(f"Error importing libraries: {e}")
     print("Please ensure 'torch', 'transformers', 'accelerate', 'bitsandbytes' are installed.")
