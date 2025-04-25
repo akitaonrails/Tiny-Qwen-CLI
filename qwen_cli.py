@@ -20,6 +20,7 @@ from typing import List, Dict, Optional, Any, Callable
 import importlib.util
 import readline  # For better command line input experience
 import signal
+import transformers
 from helper_functions.utils import get_language_from_extension
 
 # Transformers & Torch
@@ -88,7 +89,7 @@ def load_config() -> dict:
         except Exception as e:
             logger.error(f"Error decoding config file {config_path}: {e}. Using defaults.")
     else:
-        config_dir.mkdir(parents=True, exist_ok=True)
+        get_config_path().parent.mkdir(parents=True, exist_ok=True)
         logger.info("No config.json found, using default settings.")
     return config
 
