@@ -93,25 +93,41 @@ def load_config() -> dict:
 def load_helper_functions(helpers_dir: str) -> (Dict[str, Callable], List[str]):
     helpers = {}
     tool_prompts = []
-    helpers_path = Path(helpers_dir)
-    if not helpers_path.exists():
-        helpers_path.mkdir(parents=True, exist_ok=True)
-        (helpers_path / "__init__.py").touch()
-    for py_file in helpers_path.glob("*.py"):
-        module_name = py_file.stem
-        if module_name.startswith("__"): continue
-        spec = importlib.util.spec_from_file_location(module_name, py_file)
+    
+    def load_module(module_name: str):
+        spec = importlib.util.spec_from_file_location(module_name, Path(helpers_dir) / f"{module_name}.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module
+
+    def get_helper_functions(module):
+        helper_funcs = {}
         for attr_name in dir(module):
             if attr_name.startswith("handle_"):
                 func = getattr(module, attr_name)
                 command = attr_name[7:].upper()
-                helpers[command] = func
+                helper_funcs[command] = func
                 doc = func.__doc__ or ""
                 first_line = doc.strip().splitlines()[0] if doc.strip() else ""
                 if first_line:
                     tool_prompts.append(f"[{command} args] – {first_line}")
+        return helper_funcs
+
+    def load_helpers_from_directory():
+        helpers_path = Path(helpers_dir)
+        if not helpers_path.exists():
+            helpers_path.mkdir(parents=True, exist_ok=True)
+            (helpers_path / "__init__.py").touch()
+        
+        for py_file in helpers_path.glob("*.py"):
+            module_name = py_file.stem
+            if module_name.startswith("__"): continue
+            
+            module = load_module(module_name)
+            helpers.update(get_helper_functions(module))
+    
+    load_helpers_from_directory()
+    
     return helpers, tool_prompts
 
 # --- Parse Special Commands ---
