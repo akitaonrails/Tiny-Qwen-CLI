@@ -97,22 +97,38 @@ def load_helper_functions(helpers_dir: str) -> (Dict[str, Callable], List[str]):
     if not helpers_path.exists():
         helpers_path.mkdir(parents=True, exist_ok=True)
         (helpers_path / "__init__.py").touch()
+    
     for py_file in helpers_path.glob("*.py"):
         module_name = py_file.stem
-        if module_name.startswith("__"): continue
+        if module_name.startswith("__"): 
+            continue
         spec = importlib.util.spec_from_file_location(module_name, py_file)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for attr_name in dir(module):
-            if attr_name.startswith("handle_"):
-                func = getattr(module, attr_name)
-                command = attr_name[7:].upper()
-                helpers[command] = func
-                doc = func.__doc__ or ""
-                first_line = doc.strip().splitlines()[0] if doc.strip() else ""
-                if first_line:
-                    tool_prompts.append(f"[{command} args] – {first_line}")
+        
+        # Process the module for helper functions
+        commands, prompts = _process_helper_module(module)
+        helpers.update(commands)
+        tool_prompts.extend(prompts)
+    
     return helpers, tool_prompts
+
+def _process_helper_module(module) -> (Dict[str, Callable], List[str]):
+    """Process a single module to extract handle_ functions and their descriptions."""
+    commands = {}
+    prompts = []
+    
+    for attr_name in dir(module):
+        if attr_name.startswith("handle_"):
+            func = getattr(module, attr_name)
+            command = attr_name[7:].upper()
+            commands[command] = func
+            doc = func.__doc__ or ""
+            first_line = doc.strip().splitlines()[0] if doc.strip() else ""
+            if first_line:
+                prompts.append(f"[{command} args] – {first_line}")
+    
+    return commands, prompts
 
 # --- Parse Special Commands ---
 def parse_special_commands(response: str) -> List[tuple]:
@@ -150,6 +166,7 @@ class QwenSession:
         return session
 
     def _ensure_model_loaded(self) -> bool:
+        """Ensure the model and tokenizer are loaded, handling concurrency."""
         if QwenSession._model and QwenSession._tokenizer:
             return True
         if QwenSession._model_loading_lock:
@@ -163,237 +180,136 @@ class QwenSession:
         model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
         quantization = self.config.get("quantization", DEFAULT_CONFIG["quantization"]).lower()
         download_timeout = self.config.get("model_download_timeout", DEFAULT_CONFIG["model_download_timeout"])
-        if not model_dir.exists():
-            model_dir.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "clone", "--depth", "1", f"https://huggingface.co/{model_repo}", str(model_dir)], check=False, timeout=download_timeout)
+
+        # Ensure the model directory exists and clone if needed
+        self._ensure_model_directory(model_dir, model_repo, download_timeout)
 
         try:
             QwenSession._tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True, cache_dir=str(CACHE_DIR))
             model_kwargs = {"trust_remote_code": True, "device_map": "auto", "cache_dir": str(CACHE_DIR)}
 
-            # *** ATTENTION OPTIMIZATION ***
-            model_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+            # Configure attention mechanism (SDPA or xFormers)
+            self._configure_attention(model_dir)
 
-            # 1. Feature Detection (SDPA)
-            sdpa_compatible = False
-            try:
-                # This is a VERY rough check; you might need to adapt it
-                # based on the Qwen model's attention class name
-                for name, module in QwenSession._model.named_modules():
-                    if "attention" in name.lower() and isinstance(module, transformers.models.qwen2.modeling_qwen2.Qwen2Attention):  # Adapt this line
-                        sdpa_compatible = True
-                        break
-            except Exception:  # Catch ANY exception here (more robust)
-                pass
+            # Apply quantization settings
+            self._apply_quantization(quantization, model_kwargs)
 
-            if sdpa_compatible and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
-                print("Qwen attention is SDPA-compatible, and SDPA is available!")
-                # You might need to add code here to FORCE the model to use SDPA
-                # This is the tricky part and depends on the transformers version
-                # and the Qwen model's implementation
-            else:
-                print("Qwen attention is NOT SDPA-compatible, or SDPA is not available. Trying xFormers...")
-                try:
-                    import xformers.ops  # Test if xFormers is installed
-                    model_config.attention_implementation = "flash_attention_2"  # Or "memory_efficient"
-                    print("xFormers is available. Enabling it for attention.")
-                except ImportError:
-                    print("xFormers is not installed. Falling back to default attention.")
-                except Exception as e:  # Catch other xFormers errors
-                    print(f"Error using xFormers: {e}")
-
-            if quantization == "4bit" and torch.cuda.is_available():
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            elif quantization == "8bit" and torch.cuda.is_available():
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            else:
-                model_kwargs["torch_dtype"] = "auto"
-            QwenSession._model = AutoModelForCausalLM.from_pretrained(str(model_dir), config=model_config, **model_kwargs)
+            # Load the model with configured parameters
+            QwenSession._model = AutoModelForCausalLM.from_pretrained(str(model_dir), config=AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True), **model_kwargs)
             QwenSession._model_loading_lock = False
 
-            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
-                print("SDPA is available and (hopefully) being used!")
-            else:
-                print("SDPA is available in PyTorch, but may not be used by the model.")
-        
+            self._log_attention_status()
             return True
         except Exception as e:
             logger.error(f"Failed to load model or tokenizer: {e}")
             QwenSession._model_loading_lock = False
             return False
 
+    def _ensure_model_directory(self, model_dir: Path, model_repo: str, download_timeout: int):
+        """Ensure the model directory exists and clone the repository if needed."""
+        if not model_dir.exists():
+            model_dir.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "clone", "--depth", "1", f"https://huggingface.co/{model_repo}", str(model_dir)], check=False, timeout=download_timeout)
+
+    def _configure_attention(self, model_dir: Path):
+        """Configure attention mechanism based on availability (SDPA or xFormers)."""
+        model_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+        sdpa_compatible = False
+
+        try:
+            # Check if the model's attention is compatible with SDPA
+            for name, module in QwenSession._model.named_modules():
+                if "attention" in name.lower() and isinstance(module, transformers.models.qwen2.modeling_qwen2.Qwen2Attention):
+                    sdpa_compatible = True
+                    break
+        except Exception:
+            pass
+
+        if sdpa_compatible and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            print("Qwen attention is SDPA-compatible, and SDPA is available!")
+        else:
+            print("Qwen attention is NOT SDPA-compatible, or SDPA is not available. Trying xFormers...")
+            try:
+                import xformers.ops
+                model_config.attention_implementation = "flash_attention_2"
+                print("xFormers is available. Enabling it for attention.")
+            except ImportError:
+                print("xFormers is not installed. Falling back to default attention.")
+            except Exception as e:
+                print(f"Error using xFormers: {e}")
+
+    def _apply_quantization(self, quantization: str, model_kwargs: dict):
+        """Apply quantization settings based on the configuration."""
+        if quantization == "4bit" and torch.cuda.is_available():
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        elif quantization == "8bit" and torch.cuda.is_available():
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            model_kwargs["torch_dtype"] = "auto"
+
+    def _log_attention_status(self):
+        """Log the status of the attention mechanism."""
+        if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            print("SDPA is available and (hopefully) being used!")
+        else:
+            print("SDPA is available in PyTorch, but may not be used by the model.")
+
     def _trim_history(self, max_tokens: int):
         # identical trimming logic as before
         pass
 
     def chat(self, prompt: str, helper_functions: Dict[str, Callable], max_new_tokens=None, temperature=None, stream=True, hide_reasoning=False) -> bool:
+        """Main chat loop with improved structure and separation of concerns."""
         self.last_used = datetime.now().isoformat()
-        if max_new_tokens is None:
-            max_new_tokens = self.config.get("max_new_tokens", DEFAULT_CONFIG["max_new_tokens"])
-        if temperature is None:
-            temperature = self.config.get("temperature", DEFAULT_CONFIG["temperature"])
-        self._trim_history(self.config.get("max_context_tokens", DEFAULT_CONFIG["max_context_tokens"]))
-
-        self.history.append({"role": "user", "content": prompt})
+        
+        # Initialize parameters and trim history
+        self._initialize_chat_parameters(max_new_tokens, temperature)
+        
+        # Append user prompt to history
+        self._append_user_prompt(prompt)
+        
         try:
-            formatted_text = QwenSession._tokenizer.apply_chat_template(
-                self.history, tokenize=False, add_generation_prompt=True
-            )
-            inputs = QwenSession._tokenizer([formatted_text], return_tensors="pt")
-            inputs = {k: v.to(QwenSession._model.device) for k, v in inputs.items()}
-            streamer = TextStreamer(QwenSession._tokenizer, skip_prompt=True, skip_special_tokens=True) if stream else None
-            out_ids = QwenSession._model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=temperature>0,
-                temperature=temperature, streamer=streamer, repetition_penalty=1.1
-            )
-            generated = out_ids[0][inputs["input_ids"].shape[1]:]
-            response_text = QwenSession._tokenizer.decode(generated, skip_special_tokens=True)
-
-            # Other special commands
-            for cmd_type, cmd_arg, _, _ in parse_special_commands(response_text):
-                if cmd_type in helper_functions:
-                    result = helper_functions[cmd_type](cmd_arg)
-                    if result:
-                        self.history.append({"role": "system", "content": result})
-                        self.history.append({"role": "user", "content": "Please continue the analysis using the loaded file."})
-                        print(f"✅ [{cmd_type}] processed '{cmd_arg}'")
-                        return self.chat(
-                            prompt, helper_functions, max_new_tokens, temperature, stream, hide_reasoning
-                        )
-
-            self.history.append({"role": "assistant", "content": response_text})
+            # Generate response from model
+            response_text = self._generate_response(stream)
+            
+            # Process any special commands in the response
+            self._process_special_commands(response_text, helper_functions)
+            
+            # Update history with assistant's response
+            self._update_history_with_response(response_text)
+            
             return True
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             logger.error(traceback.format_exc())
             return False
 
-    def list_files(self):
-        if not self.files_loaded:
-            print("No files loaded in this session.")
-        else:
-            print(f"Files loaded in session '{self.name}' :")
-            for i, (filepath, meta) in enumerate(self.files_loaded.items(), 1):
-                print(f"  {i}. {filepath}")
+    def _initialize_chat_parameters(self, max_new_tokens: Optional[int], temperature: Optional[float]):
+        """Initialize chat parameters with defaults if not provided."""
+        if max_new_tokens is None:
+            max_new_tokens = self.config.get("max_new_tokens", DEFAULT_CONFIG["max_new_tokens"])
+        if temperature is None:
+            temperature = self.config.get("temperature", DEFAULT_CONFIG["temperature"])
+        
+        # Trim history to fit within context token limit
+        self._trim_history(self.config.get("max_context_tokens", DEFAULT_CONFIG["max_context_tokens"]))
 
-    def clear_history(self, keep_files=True):
-        system_prompt = self.history[0]["content"]
-        file_msgs = []
-        if keep_files:
-            for msg in self.history:
-                if msg.get("role") == "system" and msg.get("content", "").startswith("[file:"):
-                    file_msgs.append(msg)
-        self.history = [{"role": "system", "content": system_prompt}] + file_msgs
-        logger.info("Conversation history cleared")
-        return True
+    def _append_user_prompt(self, prompt: str):
+        """Append the user's prompt to the conversation history."""
+        self.history.append({"role": "user", "content": prompt})
 
-# --- Interactive Chat ---
-def interactive_chat(session, helper_functions, hide_reasoning=False):
-    print(f"\nInteractive chat session started. Type 'bye' to exit.\n")
-    print("SYSTEM PROMPT:")
-    print(session.history[0]["content"])
-
-    def handle_exit():  # Define a function to handle exiting
-        print("\nExiting chat session. Goodbye!\n")
-        exit(0)  # Cleanly exit the program
-
-    def handle_ctrl_d(sig, frame):  # Handler for Ctrl+D
-        print("\nCtrl+D detected.")
-        handle_exit()
-
-    signal.signal(signal.SIGHUP, handle_ctrl_d)  # Register the handler (SIGHUP is sent by Ctrl+D)
-
-    while True:
-        try:
-            prompt = input("\n>>> ")
-            if prompt.strip().lower() == "bye":
-                print("Goodbye! Exiting chat session.")
-                break
-            if not prompt.strip():  # Check for empty prompt
-                print("Ignoring empty input.")
-                continue  # Skip the rest of the loop and ask for input again
-            session.chat(prompt, helper_functions, hide_reasoning=hide_reasoning)
-        except KeyboardInterrupt:
-            print("\nInterrupted by user. Type 'bye' to exit properly.")
-        except EOFError:  # Catch Ctrl+D directly (alternative method)
-            print("\nEOF (Ctrl+D) detected. Exiting...")
-            handle_exit()
-            break
-        except Exception as e:
-            logger.error(f"Error in chat: {e}")
-            logger.error(traceback.format_exc())
-            print(f"An error occurred: {e}")
-
-# --- Main CLI ---
-def main():
-    parser = argparse.ArgumentParser(description="Qwen CLI - Code-aware conversation tool")
-    parser.add_argument("--model-dir","-m")
-    parser.add_argument("--config-dir","-c")
-    parser.add_argument("--helpers-dir")
-    parser.add_argument("--hide-reasoning", action="store_true")
-    parser.add_argument("cmd", nargs="?", help="Command or chat prompt")
-    parser.add_argument("args", nargs="*", help="Arguments for commands or prompt")
-    args = parser.parse_args()
-
-    global DEFAULT_CONFIG
-    if args.config_dir:
-        os.environ["CONFIG_DIR"] = args.config_dir
-    if args.model_dir:
-        os.environ["MODELS_DIR"] = args.model_dir
-
-    config = load_config()
-    if args.helpers_dir:
-        config["helpers_dir"] = args.helpers_dir
-
-    helper_functions, tool_prompts = load_helper_functions(config["helpers_dir"])
-    session = QwenSession(config, tool_prompts)
-
-    # Load the model immediately after session initialization
-    if not session._ensure_model_loaded():
-        print("Failed to load model. Exiting.")
-        return
-
-    # Command dispatch
-    if args.cmd == "new":
-        session = QwenSession(config, tool_prompts)
-        interactive_chat(session, helper_functions, args.hide_reasoning)
-        return
-    if args.cmd == "batch_load":
-        if args.args:
-            result = helper_functions["BATCH_LOAD"](" ".join(args.args))
-            if result:
-                print(result)
-        else:
-            print("Usage: batch_load <directory> <pattern>")
-    elif args.cmd == "load":
-        if args.args:
-            filepath = args.args[0]
-            result = helper_functions["LOAD_FILE"](filepath)
-            if result:
-                print(result)
-        else:
-            print("Usage: load <filepath>")
-    elif args.cmd == "help":
-        print("Commands: new, batch_load, load, list, clear, help")
-    elif args.cmd is None:
-        interactive_chat(session, helper_functions, args.hide_reasoning)
-    else:
-        # chat or plugin
-        lc = args.cmd.upper()
-        if lc in helper_functions:
-            result = helper_functions[lc](' '.join(args.args))
-            print(result or f"{lc} returned no output.")
-        else:
-            prompt = " ".join([args.cmd]+args.args)
-            session.chat(prompt, helper_functions, args.hide_reasoning)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted. Exiting.")
-    except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+    def _generate_response(self, stream: bool) -> str:
+        """Generate a response from the model based on current history."""
+        formatted_text = QwenSession._tokenizer.apply_chat_template(
+            self.history, tokenize=False, add_generation_prompt=True
+        )
+        inputs = QwenSession._tokenizer([formatted_text], return_tensors="pt")
+        inputs = {k: v.to(QwenSession._model.device) for k, v in inputs.items()}
+        
+        streamer = TextStreamer(QwenSession._tokenizer, skip_prompt=True, skip_special_tokens=True) if stream else None
+        
+        out_ids = QwenSession._model.generate(
+            **inputs,
+            max_new_tokens=self.config.get("max_new_tokens", DEFAULT_CONFIG["max_new_tokens"]),
+            do_sample=self.config.get("temperature", DEFAULT线索
