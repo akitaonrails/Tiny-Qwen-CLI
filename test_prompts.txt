@@ -1,0 +1,18 @@
+em cima do método main():
+# this is the main method and it's ok if it's a bit longer than the others, in the sake of legibility, but see if you can improve on clean code and refactor AI!
+
+em cima do método chat():
+# below is the chat method that controls the main chat loop. it's very long, please refactor to better isolate responsabilities AI!
+
+em cima do método _ensure_..():
+# this next method is super long and convoluted and could use refactoring to better separate responsabilities AI!
+
+em cima do método load_helper..():
+# this next method is not so bad but may use some refactoring, can you lightly refactor this one AI!
+
+direto no chat do aider (se conseguir refatorar):
+
+now I need you to create a test_qwen_cli.py new file and add unittests just for the load_helper_functions. this method dynamically loads scripts such as load_file.py or fetch_url.py or other scripts from helper_functions/. you don't need to hard code a specific amount as I can add more helper scripts later. each script has a handle method with a docstring. this docstring is appended to the system prompt so the model assistant can use those templates to ask, for example, to load a file from the local filesystem by saying '[LOAD_FILE test.txt]' and the content will be loaded into the session history. you can mock a few thing but don't over-mock or the test may become brittle. be smart with this test.
+
+
+ok, now I need you to add unittest for the main chat method. you need to mock the model assistant and create canned responses. I need you to ask the assistant to load a new file and the assistant to return a '[LOAD_FILE ...]' to simulate the parser picking that up and calling a loaded helper. do not add unnecessary mocks, you can assume scripts like load_file or fetch_url are there. you can mock not loading a real file or not fetching a real url and make canned responses for that if you feel that's the best solution.
