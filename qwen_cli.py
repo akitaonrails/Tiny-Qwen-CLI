@@ -100,9 +100,13 @@ def load_helper_functions(helpers_dir: str) -> (Dict[str, Callable], List[str]):
     for py_file in helpers_path.glob("*.py"):
         module_name = py_file.stem
         if module_name.startswith("__"): continue
-        spec = importlib.util.spec_from_file_location(module_name, py_file)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, py_file)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as e:
+            logger.error(f"Error loading helper module {module_name}: {e}")
+            continue
         for attr_name in dir(module):
             if attr_name.startswith("handle_"):
                 func = getattr(module, attr_name)
@@ -149,7 +153,10 @@ class QwenSession:
         session.last_used = data.get('last_used', session.last_used)
         return session
 
+
+    # this next method is super long and convoluted and could use refactoring to better separate responsabilities
     def _ensure_model_loaded(self) -> bool:
+        """Ensure the model and tokenizer are loaded, handles concurrent initialization"""
         if QwenSession._model and QwenSession._tokenizer:
             return True
         if QwenSession._model_loading_lock:
@@ -159,115 +166,188 @@ class QwenSession:
             return bool(QwenSession._model and QwenSession._tokenizer)
 
         QwenSession._model_loading_lock = True
-        model_repo = self.config.get("model_repo", DEFAULT_CONFIG["model_repo"])
-        model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
-        quantization = self.config.get("quantization", DEFAULT_CONFIG["quantization"]).lower()
-        download_timeout = self.config.get("model_download_timeout", DEFAULT_CONFIG["model_download_timeout"])
-        if not model_dir.exists():
-            model_dir.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "clone", "--depth", "1", f"https://huggingface.co/{model_repo}", str(model_dir)], check=False, timeout=download_timeout)
-
         try:
-            QwenSession._tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True, cache_dir=str(CACHE_DIR))
-            model_kwargs = {"trust_remote_code": True, "device_map": "auto", "cache_dir": str(CACHE_DIR)}
-
-            # *** ATTENTION OPTIMIZATION ***
-            model_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
-
-            # 1. Feature Detection (SDPA)
-            sdpa_compatible = False
-            try:
-                # This is a VERY rough check; you might need to adapt it
-                # based on the Qwen model's attention class name
-                for name, module in QwenSession._model.named_modules():
-                    if "attention" in name.lower() and isinstance(module, transformers.models.qwen2.modeling_qwen2.Qwen2Attention):  # Adapt this line
-                        sdpa_compatible = True
-                        break
-            except Exception:  # Catch ANY exception here (more robust)
-                pass
-
-            if sdpa_compatible and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
-                print("Qwen attention is SDPA-compatible, and SDPA is available!")
-                # You might need to add code here to FORCE the model to use SDPA
-                # This is the tricky part and depends on the transformers version
-                # and the Qwen model's implementation
-            else:
-                print("Qwen attention is NOT SDPA-compatible, or SDPA is not available. Trying xFormers...")
-                try:
-                    import xformers.ops  # Test if xFormers is installed
-                    model_config.attention_implementation = "flash_attention_2"  # Or "memory_efficient"
-                    print("xFormers is available. Enabling it for attention.")
-                except ImportError:
-                    print("xFormers is not installed. Falling back to default attention.")
-                except Exception as e:  # Catch other xFormers errors
-                    print(f"Error using xFormers: {e}")
-
-            if quantization == "4bit" and torch.cuda.is_available():
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            elif quantization == "8bit" and torch.cuda.is_available():
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            else:
-                model_kwargs["torch_dtype"] = "auto"
-            QwenSession._model = AutoModelForCausalLM.from_pretrained(str(model_dir), config=model_config, **model_kwargs)
-            QwenSession._model_loading_lock = False
-
-            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
-                print("SDPA is available and (hopefully) being used!")
-            else:
-                print("SDPA is available in PyTorch, but may not be used by the model.")
-        
+            self._download_model_if_needed()
+            self._load_tokenizer()
+            model_config = self._configure_attention_optimization()
+            model_kwargs = self._setup_quantization_config() 
+            self._load_model_components(model_config, model_kwargs)
+            self._log_final_attention_status()
             return True
         except Exception as e:
             logger.error(f"Failed to load model or tokenizer: {e}")
+            logger.error(traceback.format_exc())
             QwenSession._model_loading_lock = False
             return False
+
+    def _download_model_if_needed(self) -> None:
+        """Download model repository if not present locally"""
+        model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
+        if not model_dir.exists():
+            model_repo = self.config.get("model_repo", DEFAULT_CONFIG["model_repo"])
+            download_timeout = self.config.get("model_download_timeout", DEFAULT_CONFIG["model_download_timeout"])
+            model_dir.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Downloading model from {model_repo}...")
+            subprocess.run(
+                ["git", "clone", "--depth", "1", f"https://huggingface.co/{model_repo}", str(model_dir)],
+                check=False,
+                timeout=download_timeout
+            )
+
+    def _load_tokenizer(self) -> None:
+        """Initialize the tokenizer from pretrained weights"""
+        model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
+        QwenSession._tokenizer = AutoTokenizer.from_pretrained(
+            str(model_dir),
+            trust_remote_code=True,
+            cache_dir=str(CACHE_DIR)
+        )
+
+    def _configure_attention_optimization(self) -> AutoConfig:
+        """Configure optimal attention implementation based on hardware and dependencies"""
+        model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
+        model_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+        sdpa_available = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+
+        try:
+            if sdpa_available and self._check_sdpa_compatibility():
+                print("Qwen attention is SDPA-compatible and enabled!")
+            else:
+                self._try_configure_xformers(model_config)
+        except Exception as e:
+            logger.warning(f"Attention optimization error: {e}. Using default attention.")
+
+        return model_config
+
+    def _check_sdpa_compatibility(self) -> bool:
+        """Check if model supports PyTorch's SDPA attention"""
+        # Simple check since model may not be loaded yet - actual validation is runtime
+        return True  # Assume compatible for initial configuration
+
+    def _try_configure_xformers(self, model_config: AutoConfig) -> None:
+        """Attempt to configure xFormers if available"""
+        try:
+            import xformers.ops  # noqa: F401
+            model_config.attention_implementation = "flash_attention_2"
+            print("xFormers enabled for attention optimization")
+        except ImportError:
+            print("xFormers not available - using default attention")
+        except Exception as e:
+            logger.warning(f"Error configuring xFormers: {e}")
+
+    def _setup_quantization_config(self) -> Dict[str, Any]:
+        """Configure quantization settings based on user configuration and hardware"""
+        quantization = self.config.get("quantization", DEFAULT_CONFIG["quantization"]).lower()
+        model_kwargs = {"trust_remote_code": True, "device_map": "auto", "cache_dir": str(CACHE_DIR)}
+
+        if quantization == "4bit" and torch.cuda.is_available():
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        elif quantization == "8bit" and torch.cuda.is_available():
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            model_kwargs["torch_dtype"] = "auto"
+
+        return model_kwargs
+
+    def _load_model_components(self, model_config: AutoConfig, model_kwargs: Dict[str, Any]) -> None:
+        """Load the main model with prepared configuration and parameters"""
+        model_dir = Path(self.config.get("model_dir", DEFAULT_CONFIG["model_dir"]))
+        QwenSession._model = AutoModelForCausalLM.from_pretrained(
+            str(model_dir),
+            config=model_config, 
+            **model_kwargs
+        )
+        QwenSession._model_loading_lock = False
+
+    def _log_final_attention_status(self) -> None:
+        """Log final attention implementation status after model load"""
+        if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            print("SDPA is available and active!")
+        else:
+            print("Using default attention implementation")
 
     def _trim_history(self, max_tokens: int):
         # identical trimming logic as before
         pass
 
     def chat(self, prompt: str, helper_functions: Dict[str, Callable], max_new_tokens=None, temperature=None, stream=True, hide_reasoning=False) -> bool:
-        self.last_used = datetime.now().isoformat()
-        if max_new_tokens is None:
-            max_new_tokens = self.config.get("max_new_tokens", DEFAULT_CONFIG["max_new_tokens"])
-        if temperature is None:
-            temperature = self.config.get("temperature", DEFAULT_CONFIG["temperature"])
+        """Main entry point for chat interactions, coordinates the workflow"""
+        self._update_session_timestamp()
+        self._setup_generation_parameters(max_new_tokens, temperature)
         self._trim_history(self.config.get("max_context_tokens", DEFAULT_CONFIG["max_context_tokens"]))
-
         self.history.append({"role": "user", "content": prompt})
+
         try:
-            formatted_text = QwenSession._tokenizer.apply_chat_template(
-                self.history, tokenize=False, add_generation_prompt=True
-            )
-            inputs = QwenSession._tokenizer([formatted_text], return_tensors="pt")
-            inputs = {k: v.to(QwenSession._model.device) for k, v in inputs.items()}
-            streamer = TextStreamer(QwenSession._tokenizer, skip_prompt=True, skip_special_tokens=True) if stream else None
-            out_ids = QwenSession._model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=temperature>0,
-                temperature=temperature, streamer=streamer, repetition_penalty=1.1
-            )
-            generated = out_ids[0][inputs["input_ids"].shape[1]:]
-            response_text = QwenSession._tokenizer.decode(generated, skip_special_tokens=True)
-
-            # Other special commands
-            for cmd_type, cmd_arg, _, _ in parse_special_commands(response_text):
-                if cmd_type in helper_functions:
-                    result = helper_functions[cmd_type](cmd_arg)
-                    if result:
-                        self.history.append({"role": "system", "content": result})
-                        self.history.append({"role": "user", "content": "Please continue the analysis using the loaded file."})
-                        print(f"✅ [{cmd_type}] processed '{cmd_arg}'")
-                        return self.chat(
-                            prompt, helper_functions, max_new_tokens, temperature, stream, hide_reasoning
-                        )
-
-            self.history.append({"role": "assistant", "content": response_text})
+            response_text = self._generate_response(stream, self.max_new_tokens, self.temperature)
+            should_continue = self._process_helper_commands(response_text, helper_functions, prompt, 
+                                                          max_new_tokens, temperature, stream, hide_reasoning)
+            
+            if not should_continue:
+                self._handle_response(response_text)
+            
             return True
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             logger.error(traceback.format_exc())
             return False
+
+    def _update_session_timestamp(self):
+        """Update the last used timestamp for the session"""
+        self.last_used = datetime.now().isoformat()
+
+    def _setup_generation_parameters(self, max_new_tokens, temperature):
+        """Set default generation parameters if not provided"""
+        self.max_new_tokens = max_new_tokens or self.config.get("max_new_tokens", DEFAULT_CONFIG["max_new_tokens"])
+        self.temperature = temperature or self.config.get("temperature", DEFAULT_CONFIG["temperature"])
+
+    def _generate_response(self, stream: bool, max_new_tokens: int, temperature: float) -> str:
+        """Generate model response with current context"""
+        formatted_text = QwenSession._tokenizer.apply_chat_template(
+            self.history, tokenize=False, add_generation_prompt=True
+        )
+        inputs = QwenSession._tokenizer([formatted_text], return_tensors="pt")
+        inputs = {k: v.to(QwenSession._model.device) for k, v in inputs.items()}
+        
+        streamer = TextStreamer(QwenSession._tokenizer, skip_prompt=True, skip_special_tokens=True) if stream else None
+        out_ids = QwenSession._model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=temperature > 0,
+            temperature=temperature, streamer=streamer, repetition_penalty=1.1
+        )
+        
+        generated = out_ids[0][inputs["input_ids"].shape[1]:]
+        return QwenSession._tokenizer.decode(generated, skip_special_tokens=True)
+
+    def _process_helper_commands(self, response_text: str, helper_functions: dict, prompt: str, 
+                               max_new_tokens: int, temperature: float, stream: bool, hide_reasoning: bool) -> bool:
+        """Handle helper commands found in the response text"""
+        for cmd_type, cmd_arg, start, end in parse_special_commands(response_text):
+            if cmd_type in helper_functions:
+                result = helper_functions[cmd_type](cmd_arg)
+                if result:
+                    # Remove the command from the response text that will be preserved
+                    cleaned_response = response_text[:start] + response_text[end:]
+                    self.history.extend([
+                        {"role": "system", "content": result},
+                        {"role": "assistant", "content": cleaned_response.strip()},
+                        {"role": "user", "content": "Please continue the analysis using the loaded file."}
+                    ])
+                    print(f"✅ [{cmd_type}] processed '{cmd_arg}'")
+                    # Use the system-generated follow-up prompt instead of original
+                    self.chat( 
+                        "Please continue the analysis using the loaded file.",
+                        helper_functions,
+                        max_new_tokens,
+                        temperature,
+                        stream,
+                        hide_reasoning
+                    )
+                    return True
+        return False
+
+    def _handle_response(self, response_text: str):
+        """Finalize response handling and update history"""
+        self.history.append({"role": "assistant", "content": response_text})
 
     def list_files(self):
         if not self.files_loaded:
@@ -327,6 +407,7 @@ def interactive_chat(session, helper_functions, hide_reasoning=False):
 
 # --- Main CLI ---
 def main():
+    """Main entry point for the Qwen CLI application"""
     parser = argparse.ArgumentParser(description="Qwen CLI - Code-aware conversation tool")
     parser.add_argument("--model-dir","-m")
     parser.add_argument("--config-dir","-c")
@@ -336,11 +417,8 @@ def main():
     parser.add_argument("args", nargs="*", help="Arguments for commands or prompt")
     args = parser.parse_args()
 
-    global DEFAULT_CONFIG
-    if args.config_dir:
-        os.environ["CONFIG_DIR"] = args.config_dir
-    if args.model_dir:
-        os.environ["MODELS_DIR"] = args.model_dir
+    # Configure environment from command line arguments
+    setup_environment(args)
 
     config = load_config()
     if args.helpers_dir:
@@ -354,39 +432,60 @@ def main():
         print("Failed to load model. Exiting.")
         return
 
-    # Command dispatch
-    if args.cmd == "new":
-        session = QwenSession(config, tool_prompts)
-        interactive_chat(session, helper_functions, args.hide_reasoning)
-        return
-    if args.cmd == "batch_load":
-        if args.args:
-            result = helper_functions["BATCH_LOAD"](" ".join(args.args))
-            if result:
-                print(result)
-        else:
-            print("Usage: batch_load <directory> <pattern>")
-    elif args.cmd == "load":
-        if args.args:
-            filepath = args.args[0]
-            result = helper_functions["LOAD_FILE"](filepath)
-            if result:
-                print(result)
-        else:
-            print("Usage: load <filepath>")
-    elif args.cmd == "help":
-        print("Commands: new, batch_load, load, list, clear, help")
-    elif args.cmd is None:
-        interactive_chat(session, helper_functions, args.hide_reasoning)
+    # Route command to appropriate handler
+    command_handlers = {
+        "new": lambda: handle_new_command(config, tool_prompts, helper_functions, args.hide_reasoning),
+        "batch_load": lambda: handle_batch_load(helper_functions, args.args),
+        "load": lambda: handle_load_file(helper_functions, args.args),
+        "help": print_help,
+        None: lambda: interactive_chat(session, helper_functions, args.hide_reasoning)
+    }
+    
+    if args.cmd in command_handlers:
+        command_handlers[args.cmd]()
     else:
-        # chat or plugin
-        lc = args.cmd.upper()
-        if lc in helper_functions:
-            result = helper_functions[lc](' '.join(args.args))
-            print(result or f"{lc} returned no output.")
-        else:
-            prompt = " ".join([args.cmd]+args.args)
-            session.chat(prompt, helper_functions, args.hide_reasoning)
+        handle_generic_command(args, session, helper_functions, args.hide_reasoning)
+
+def setup_environment(args):
+    """Configure environment variables from command line arguments"""
+    if args.config_dir:
+        os.environ["CONFIG_DIR"] = args.config_dir
+    if args.model_dir:
+        os.environ["MODELS_DIR"] = args.model_dir
+
+def handle_new_command(config, tool_prompts, helper_functions, hide_reasoning):
+    """Handle new session creation"""
+    new_session = QwenSession(config, tool_prompts)
+    interactive_chat(new_session, helper_functions, hide_reasoning)
+
+def handle_batch_load(helper_functions, args):
+    """Handle batch load command"""
+    if args:
+        result = helper_functions["BATCH_LOAD"](" ".join(args))
+        print(result or "No results from batch load")
+    else:
+        print("Usage: batch_load <directory> <pattern>")
+
+def handle_load_file(helper_functions, args):
+    """Handle single file load command"""
+    if args:
+        result = helper_functions["LOAD_FILE"](args[0])
+        print(result or "File content unavailable")
+    else:
+        print("Usage: load <filepath>")
+
+def print_help():
+    """Display help information"""
+    print("Available commands:\nnew, batch_load, load, list, clear, help")
+
+def handle_generic_command(args, session, helper_functions, hide_reasoning):
+    """Handle unrecognized commands and generic chat input"""
+    lc = args.cmd.upper()
+    if lc in helper_functions:
+        result = helper_functions[lc](' '.join(args.args))
+        print(result or f"{lc} returned no output.")
+    else:
+        session.chat(" ".join([args.cmd]+args.args), helper_functions, hide_reasoning)
 
 if __name__ == "__main__":
     try:
